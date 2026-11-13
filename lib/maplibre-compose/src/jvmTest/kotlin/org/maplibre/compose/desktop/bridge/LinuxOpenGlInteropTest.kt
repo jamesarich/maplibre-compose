@@ -281,6 +281,75 @@ class LinuxOpenGlInteropTest {
       }
     }
 
+  @Test
+  fun `the host-memory readback presents each new frame`() =
+    onLinux("the Linux OpenGL bridge this reads back exists only on Linux") {
+      assumeTrue("only a Vulkan producer reads back", packagedProducer() == MapRenderBackend.Vulkan)
+      runMapTest {
+        EglTestContext.create().use { egl ->
+          val host =
+            LinuxOpenGlMapHost(
+              EglPresentationHost(egl).host,
+              MapRenderBackend.Vulkan,
+              forceReadback = true,
+            )
+          try {
+            InteropMap(host).use { map ->
+              val first = map.renderStyle(egl, FirstStyle, FirstExtent)
+              assertNear(
+                FirstPixel,
+                egl.withCurrent { egl.drawAndRead(host, first) },
+                "first read-back frame",
+              )
+              val second = map.renderStyle(egl, SecondStyle, FirstExtent)
+              assertNear(
+                SecondPixel,
+                egl.withCurrent { egl.drawAndRead(host, second) },
+                "second read-back frame",
+              )
+            }
+          } finally {
+            host.close()
+          }
+        }
+      }
+    }
+
+  @Test
+  fun `a resize under host-memory readback can still present the last generation`() =
+    onLinux("the Linux OpenGL bridge this reads back exists only on Linux") {
+      assumeTrue("only a Vulkan producer reads back", packagedProducer() == MapRenderBackend.Vulkan)
+      runMapTest {
+        EglTestContext.create().use { egl ->
+          val host =
+            LinuxOpenGlMapHost(
+              EglPresentationHost(egl).host,
+              MapRenderBackend.Vulkan,
+              forceReadback = true,
+            )
+          try {
+            val first =
+              InteropMap(host).use { map -> map.renderStyle(egl, FirstStyle, FirstExtent) }
+            InteropMap(host).use { map ->
+              val second = map.renderStyle(egl, SecondStyle, SecondExtent)
+              assertNear(
+                FirstPixel,
+                egl.withCurrent { egl.drawAndRead(host, first) },
+                "retired read-back generation after resize",
+              )
+              assertNear(
+                SecondPixel,
+                egl.withCurrent { egl.drawAndRead(host, second) },
+                "current read-back generation after resize",
+              )
+            }
+          } finally {
+            host.close()
+          }
+        }
+      }
+    }
+
   private inline fun onLinux(reason: String, block: () -> Unit) {
     assumeTrue(reason, System.getProperty("os.name").orEmpty().lowercase().contains("linux"))
     block()

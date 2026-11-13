@@ -85,7 +85,10 @@ public sealed interface ComposeMapPresentationHost {
     /**
      * Creates a host for a window that draws Compose with OpenGL on Linux.
      *
-     * Works with the Vulkan and OpenGL MapLibre runtimes.
+     * Works with the Vulkan and OpenGL MapLibre runtimes. Maps share GPU memory with the window's
+     * context through `GL_EXT_memory_object_fd`. With the Vulkan runtime, when the OpenGL driver
+     * lacks that extension or runs on a GPU no Vulkan device can share with, each map frame is
+     * copied through system memory instead, which costs CPU time in proportion to the map's size.
      *
      * @param description A short description of the window, shown in logs and error messages.
      * @param gpuContext Returns the window's current OpenGL context. It is called only inside
