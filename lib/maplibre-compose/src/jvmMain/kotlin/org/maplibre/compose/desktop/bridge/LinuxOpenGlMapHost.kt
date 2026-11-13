@@ -37,8 +37,12 @@ import org.lwjgl.vulkan.KHRExternalMemoryFd.VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_
 import org.lwjgl.vulkan.KHRExternalMemoryFd.vkGetMemoryFdKHR
 import org.lwjgl.vulkan.VK10.VK_FORMAT_R8G8B8A8_UNORM
 import org.lwjgl.vulkan.VK10.VK_IMAGE_LAYOUT_GENERAL
+import org.lwjgl.vulkan.VK10.VK_PHYSICAL_DEVICE_TYPE_CPU
+import org.lwjgl.vulkan.VK10.vkGetPhysicalDeviceProperties
 import org.lwjgl.vulkan.VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
 import org.lwjgl.vulkan.VkMemoryGetFdInfoKHR
+import org.lwjgl.vulkan.VkPhysicalDevice
+import org.lwjgl.vulkan.VkPhysicalDeviceProperties
 import org.maplibre.compose.desktop.OpenGlComposeGpuContext
 import org.maplibre.compose.desktop.OpenGlPresentationHost
 import org.maplibre.compose.map.MapExtent
@@ -56,10 +60,17 @@ import org.maplibre.compose.mlnffi.TextureOrigin
 
 private const val VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR = 1000074002
 
-/** Shares Linux external memory between a Vulkan or EGL map producer and Compose OpenGL. */
+/**
+ * Shares Linux external memory between a Vulkan or EGL map producer and Compose OpenGL. When
+ * Compose's context cannot import a Vulkan image, or no Vulkan device matches it, a Vulkan
+ * producer's frames are copied through host memory instead; see [LinuxFrameTransfer].
+ *
+ * @param forceReadback copies frames through host memory even when Compose could import them.
+ */
 internal class LinuxOpenGlMapHost(
   presentationHost: OpenGlPresentationHost,
   producer: MapRenderBackend = MapRenderBackend.Vulkan,
+  private val forceReadback: Boolean = false,
 ) :
   SharedTextureMapHost<OpenGlComposeGpuContext, LinuxOpenGlMapHost.LinuxSharedTexture>(
     presentationHost,
@@ -69,6 +80,9 @@ internal class LinuxOpenGlMapHost(
   private val presenter = SkiaTexturePresenter(OpenGlTextureWrapper.Native)
   private var vulkan: VulkanDevice? = null
   private var egl: DesktopEglContext? = null
+
+  /** Chosen when [vulkan] is created, since the transfer decides which device it can be. */
+  private var transfer = LinuxFrameTransfer.SharedMemory
 
   @Volatile private var acquireProducerWrites = false
 
@@ -94,7 +108,15 @@ internal class LinuxOpenGlMapHost(
 
   override fun completeProducerAccess(frame: MlnFfiMapFrame) {
     super.completeProducerAccess(frame)
-    acquireProducerWrites = true
+    val texture = textures[frame.target.generation]
+    val readback = texture?.readback
+    if (readback != null) {
+      // The copy submits to the queue MapLibre renders with, so it runs on the renderer thread.
+      rendererThread.run(readback::copy)
+      texture.uploadPending = true
+    } else {
+      acquireProducerWrites = true
+    }
   }
 
   override fun present(
@@ -104,6 +126,7 @@ internal class LinuxOpenGlMapHost(
     generation: Long,
     destination: MlnFfiMapDestination,
   ): Boolean {
+    if (texture.uploadPending) texture.upload()
     if (acquireProducerWrites) {
       // EXT_memory_object does not make producer completion visible to this context. glFinish
       // acquires those writes.
@@ -165,8 +188,11 @@ internal class LinuxOpenGlMapHost(
       return
     }
 
-    val context =
-      vulkan ?: VulkanDevice.forOpenGlDevices(currentOpenGlDeviceUuids()).also { vulkan = it }
+    val context = vulkan ?: createVulkanDevice().also { vulkan = it }
+    if (transfer == LinuxFrameTransfer.Readback) {
+      recreateReadbackTexture(context, extent)
+      return
+    }
     val producerContext =
       if (producer == MapRenderBackend.OpenGl) {
         egl
@@ -210,12 +236,72 @@ internal class LinuxOpenGlMapHost(
     }
   }
 
+  /** Chooses [transfer] and the Vulkan device for it. Compose's GL context must be current. */
+  private fun createVulkanDevice(): VulkanDevice {
+    val capabilities = ensureCapabilities()
+    transfer =
+      if (forceReadback) LinuxFrameTransfer.Readback
+      else
+        linuxFrameTransfer(
+          producer,
+          capabilities.GL_EXT_memory_object && capabilities.GL_EXT_memory_object_fd,
+        )
+    if (transfer == LinuxFrameTransfer.Readback) return VulkanDevice.forReadback()
+    return try {
+      VulkanDevice.forOpenGlDevices(currentOpenGlDeviceUuids())
+    } catch (error: IllegalStateException) {
+      // No Vulkan device can export memory to Compose's GPU. A Vulkan producer can still render
+      // on any device and copy its frames.
+      if (producer != MapRenderBackend.Vulkan) throw error
+      transfer = LinuxFrameTransfer.Readback
+      try {
+        VulkanDevice.forReadback()
+      } catch (fallback: RuntimeException) {
+        fallback.addSuppressed(error)
+        throw fallback
+      }
+    }
+  }
+
+  private fun recreateReadbackTexture(context: VulkanDevice, extent: MapExtent) {
+    val image =
+      VulkanImage.create(
+        context,
+        extent,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VulkanImageMemory.Readable,
+      )
+    var readback: VulkanImageReadback? = null
+    try {
+      readback = VulkanImageReadback.create(image, VK_IMAGE_LAYOUT_GENERAL, extent)
+      val uploaded = LinuxOpenGlUploadedTexture.create(extent)
+      textures.replaceCurrent(LinuxSharedTexture(extent, image, uploaded, null, readback))
+    } catch (error: RuntimeException) {
+      readback?.close()
+      image.close()
+      throw error
+    }
+  }
+
   internal inner class LinuxSharedTexture(
     val extent: MapExtent,
     val exported: VulkanImage,
-    val imported: LinuxOpenGlImportedTexture,
+    val imported: LinuxComposeTexture,
     val producerImport: LinuxOpenGlImportedTexture?,
+    /** Copies [exported] for [imported] when Compose cannot import its memory. */
+    val readback: VulkanImageReadback? = null,
   ) : AutoCloseable {
+    /** Whether [readback] holds a frame [imported] does not show yet. */
+    @Volatile var uploadPending = false
+
+    /** Uploads the frame [readback] copied. Compose's GL context must be current. */
+    fun upload() {
+      val pixels = checkNotNull(readback?.pixels) { "Map readback is closed" }
+      (imported as LinuxOpenGlUploadedTexture).upload(pixels)
+      uploadPending = false
+    }
+
     fun target(generation: Long): MlnFfiRenderTarget =
       producerImport
         ?.target(generation)
@@ -234,6 +320,7 @@ internal class LinuxOpenGlMapHost(
       // Skia holds a surface wrapping this texture; it must be dropped before the texture is.
       presenter.forget(imported.textureName.toLong())
       imported.close()
+      readback?.close()
       exported.close()
     }
 
@@ -270,6 +357,24 @@ internal fun VulkanDevice.Companion.forOpenGlDevices(deviceUuids: Set<String>): 
     deviceUuids.isEmpty() || vulkanDeviceUuid(physical) in deviceUuids
   }
 
+/**
+ * A Vulkan device for [LinuxFrameTransfer.Readback], which shares no memory: a GPU when there is
+ * one, since a CPU device such as lavapipe would render the map in software.
+ */
+internal fun VulkanDevice.Companion.forReadback(): VulkanDevice =
+  try {
+    create { physical, _ -> !physical.isCpu() }
+  } catch (_: IllegalStateException) {
+    create()
+  }
+
+private fun VkPhysicalDevice.isCpu(): Boolean =
+  MemoryStack.stackPush().use { stack ->
+    val properties = VkPhysicalDeviceProperties.calloc(stack)
+    vkGetPhysicalDeviceProperties(this, properties)
+    properties.deviceType() == VK_PHYSICAL_DEVICE_TYPE_CPU
+  }
+
 /** A `VkImage` of [extent] whose memory is exportable to OpenGL as a file descriptor. */
 internal fun VulkanDevice.createExportableImage(extent: MapExtent) =
   VulkanImage.create(
@@ -304,18 +409,13 @@ private constructor(
   private val memorySize: Long,
   private val extent: MapExtent,
   private val origin: TextureOrigin,
-) : AutoCloseable {
+) : LinuxComposeTexture {
   private var memoryObject = 0
 
-  /** The GL name of the imported texture. */
-  var textureName: Int = 0
+  override var textureName: Int = 0
     private set
 
-  /**
-   * For presenting only: the context handles are zero and the make-current hook is a no-op, since
-   * Compose already owns this GL context.
-   */
-  fun target(generation: Long): OpenGlTextureTarget =
+  override fun target(generation: Long): OpenGlTextureTarget =
     OpenGlTextureTarget(
       context =
         EglContextHandles(NativeHandle(0), NativeHandle(0), NativeHandle(0), NativeHandle(0)),
@@ -391,8 +491,7 @@ private constructor(
     }
   }
 
-  /** Forgets names allocated by a lost context, which the replacement context must not delete. */
-  fun abandon() {
+  override fun abandon() {
     textureName = 0
     memoryObject = 0
   }

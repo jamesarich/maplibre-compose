@@ -12,6 +12,7 @@ import org.lwjgl.vulkan.VK10.VK_IMAGE_TILING_OPTIMAL
 import org.lwjgl.vulkan.VK10.VK_IMAGE_TYPE_2D
 import org.lwjgl.vulkan.VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
 import org.lwjgl.vulkan.VK10.VK_IMAGE_USAGE_SAMPLED_BIT
+import org.lwjgl.vulkan.VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
 import org.lwjgl.vulkan.VK10.VK_IMAGE_VIEW_TYPE_2D
 import org.lwjgl.vulkan.VK10.VK_SAMPLE_COUNT_1_BIT
 import org.lwjgl.vulkan.VK10.VK_SHARING_MODE_EXCLUSIVE
@@ -60,6 +61,9 @@ internal sealed interface VulkanImageMemory {
 
   /** The storage of an `MTLTexture`, which the image aliases without memory of its own. */
   data class MetalTexture(val texture: NativeHandle) : VulkanImageMemory
+
+  /** A device-local allocation the image owns, which the host reads by copying it to a buffer. */
+  data object Readable : VulkanImageMemory
 }
 
 /**
@@ -85,6 +89,10 @@ private constructor(
   var memorySize = 0L
     private set
 
+  /** The `VkImage` handle. */
+  val handle: Long
+    get() = image
+
   override fun target(generation: Long): VulkanImageTarget =
     VulkanImageTarget(
       context = vulkan.handles,
@@ -109,7 +117,12 @@ private constructor(
               .plane(VK_IMAGE_ASPECT_COLOR_BIT)
               .mtlTexture(source.texture.address)
               .address()
+          VulkanImageMemory.Readable -> NULL
         }
+      val usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT or
+          VK_IMAGE_USAGE_SAMPLED_BIT or
+          (if (source == VulkanImageMemory.Readable) VK_IMAGE_USAGE_TRANSFER_SRC_BIT else 0)
       val imageInfo =
         VkImageCreateInfo.calloc(stack)
           .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
@@ -126,7 +139,7 @@ private constructor(
           .arrayLayers(1)
           .samples(VK_SAMPLE_COUNT_1_BIT)
           .tiling(VK_IMAGE_TILING_OPTIMAL)
-          .usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT or VK_IMAGE_USAGE_SAMPLED_BIT)
+          .usage(usage)
           .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
           .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
       val imageOut = stack.mallocLong(1)
@@ -202,6 +215,11 @@ private constructor(
       }
       is VulkanImageMemory.MetalTexture ->
         error("A Metal texture's image has no memory to allocate")
+      VulkanImageMemory.Readable -> {
+        allocateNext = dedicated.address()
+        memoryTypeBits = requirements.memoryTypeBits()
+        noMemoryType = "No device-local Vulkan memory type found"
+      }
     }
     val allocateInfo =
       VkMemoryAllocateInfo.calloc(stack)

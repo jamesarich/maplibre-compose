@@ -52,6 +52,14 @@ internal class VulkanDevice private constructor() : AutoCloseable {
   val physicalDevice: VkPhysicalDevice
     get() = device.physicalDevice
 
+  /** The graphics queue MapLibre submits to. Submissions must stay on the renderer thread. */
+  val graphicsQueue: VkQueue
+    get() = checkNotNull(queue)
+
+  /** The family of [graphicsQueue]. */
+  val graphicsQueueFamily: Int
+    get() = queueFamily
+
   val handles: VulkanContextHandles
     get() =
       VulkanContextHandles(
